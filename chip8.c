@@ -18,6 +18,8 @@ void initialize(Chip8 *c8) {
   // Point the PC to 0x200
   // Use as index instead of a direct pointer to memory
   c8->pc = 0x200;
+
+  c8->running = 1;
 }
 
 // Read binary ROM file and inject it to the Chip8 memory
@@ -40,20 +42,26 @@ void loadROM(Chip8 *c8, char *rom) {
   }
 
   // Read the file bytes directly into memory, statrting at 0x200
-  fread(&c8->memory[c8->pc], sizeof(uint8_t), size, file);
+  fread(&c8->memory[0x200], sizeof(uint8_t), size, file);
   printf("Loaded file into memory\n");
+  // Paste this temporary check right after your fread inside loadROM:
+  printf("Byte at 0x200: 0x%02X\n", c8->memory[0x200]);
+  printf("Byte at 0x201: 0x%02X\n", c8->memory[0x201]);
+  printf("Byte at 0xEEA: 0x%02X\n", c8->memory[0xEEA]);
+  printf("Byte at 0xEEB: 0x%02X\n", c8->memory[0xEEB]);
 
   // Close file
   fclose(file);
 }
 
 void resetMemory(Chip8 *c8) {
-  // Set memory and stack array to 0
+  // Set memory, vRegs, and stack array to 0
   memset(c8->memory, 0, sizeof(c8->memory));
   memset(c8->stack, 0, sizeof(c8->stack));
+  memset(c8->vRegs, 0, sizeof(c8->vRegs));
+  memset(c8->graphics, 0, sizeof(c8->graphics));
 
   // Point PC to first instruction
-  c8->pc = 0x200;
   c8->I = 0;
   c8->sp = 0;
 }
@@ -66,15 +74,19 @@ long checkFileSize(FILE *f) {
   return size;
 }
 
-void executeOpcodes(Chip8 *c8, uint16_t opcode) {
+// Take whats in graphics array and transfer that to SL2 window
+void updateDisplay(Chip8 *c8, SDL_Renderer *renderer) {}
+
+void executeOpcodes(Chip8 *c8, uint16_t opcode, SDL_Renderer *renderer) {
   // Variables
-  uint8_t X, NN, Y;
-  uint16_t sum, NNN;
+  uint8_t X, Y, NN, N;
+  uint16_t sum, NNN, h, t, o, xcoord, ycoord;
   switch (opcode & 0xF000) {
   case 0x0000:
     switch (opcode) {
       // Clear Screen
     case 0x00E0:
+      SDL_RenderClear(renderer);
       break;
     // Pops top of the stack pointer SP and puts it in PC
     case 0x00EE:
@@ -258,7 +270,139 @@ void executeOpcodes(Chip8 *c8, uint16_t opcode) {
   // at coordinates (VX, VY), then VF is set to 1 if there has been a collision
   // (display bit was changed from 1 to 0)
   case 0xD000:
+    X = opcode & 0x0F00;
+    Y = opcode & 0x00F0;
+    N = opcode & 0x000F;
+    xcoord = c8->vRegs[X] % WINDOW_WIDTH;
+    ycoord = c8->vRegs[Y] % WINDOW_HEIGHT;
+
+    for (int i = 0; i < N; i++) {
+      int bits = c8->memory[c8->I + i];
+      int cy = (ycoord + i) % WINDOW_HEIGHT;
+
+      for (int j = 0; j < 8; j++) {
+        int cx = (xcoord + j) % WINDOW_WIDTH;
+        int curCol = c8->graphics[cx * cy];
+
+        int col = bits & (0x01 << 7) - j;
+
+        if (col > 0) {
+          if (curCol > 0) {
+            c8->graphics[cx * cy] = 0;
+            c8->vRegs[0xF] = 0;
+          } else {
+            c8->graphics[cx * cy] = 1;
+          }
+        }
+        if (cx == WINDOW_WIDTH - 1) {
+          break;
+        }
+      }
+      if (cy == WINDOW_HEIGHT - 1) {
+        break;
+      }
+    }
+    updateDisplay(c8, renderer);
+
     break;
+
+  case 0xE000:
+    switch (opcode & 0x000F) {
+    // EX9E => Skip the next instruction if the key with the value VX is
+    // currently pressed
+    case 0x000E:
+      X = (opcode & 0x0F00) >> 8;
+      if (c8->keypad[c8->vRegs[X]] == 1)
+        c8->pc += 2;
+
+    // EXA1 => Skip the next instruction if the key with the value of VX is
+    // currently not pressed
+    case 0x0001:
+      X = (opcode & 0x0F00) >> 8;
+      if (c8->keypad[c8->vRegs[X]] == 0)
+        c8->pc += 2;
+    }
+
+  case 0xF000:
+    switch (opcode & 0x00FF) {
+    // FX07 => Read the dealy timer register value into VX
+    case 0x0007:
+      X = (opcode & 0x0F00) >> 8;
+      c8->vRegs[X] = c8->delayTimer;
+
+    // FX0A => Wait for a key press, and then store the value into VX
+    case 0x000A:
+      X = (opcode & 0x0F00) >> 8;
+      int keyPressed = 0;
+
+      // Loop through 16-key array to see if any key is active
+      for (int i = 0; i < 16; i++) {
+        if (c8->keypad[i] == 1) {
+          c8->vRegs[X] = i;
+          keyPressed = 1;
+          break;
+        }
+      }
+      // If no key was pressed during this cycle, block execution
+      if (!keyPressed) {
+        c8->pc -= 2; // Force the CPU to repeat this opcode for the next cycle
+      }
+      break;
+
+    // FX15 => Load the value VX into the delay timer DT
+    case 0x0015:
+      X = (opcode & 0x0F00) >> 8;
+      c8->delayTimer = c8->vRegs[X];
+      break;
+
+    // FX18 => Load the value VX into the sound timer ST
+    case 0x0018:
+      X = (opcode & 0x0F00) >> 8;
+      c8->soundTimer = c8->vRegs[X];
+      break;
+
+    // FX1E => Add the values of I and VX, and store the result in I
+    case 0x001E:
+      X = (opcode & 0x0F00) >> 8;
+      c8->I += c8->vRegs[X];
+      break;
+
+    // FX29 => Set the location of the sprite for the digit VX to I
+    case 0x029:
+      X = (opcode & 0x0F00) >> 8;
+      c8->I = c8->vRegs[X] * 0x05;
+      break;
+
+    // FX33 => Store the binary-coded decimal in VX and put it in three
+    // consecutive memory slots starting at I
+    case 0x0033:
+      X = (opcode & 0x0F00) >> 8;
+      h = c8->vRegs[X] / 100;
+      t = (c8->vRegs[X] - h * 100) / 100;
+      o = (c8->vRegs[X] - h * 100 - t * 10);
+      c8->memory[c8->I] = h;
+      c8->memory[c8->I + 1] = t;
+      c8->memory[c8->I + 2] = o;
+      break;
+
+    // FX55 => Store registers from VO to VX in the main memory starting
+    // location I
+    case 0x0055:
+      X = (opcode & 0x0F00) >> 8;
+      for (int i = 0; i <= X; i++) {
+        c8->memory[c8->I + i] = c8->vRegs[i];
+      }
+      break;
+
+    // FX65 => Laod the mmeory data starting at address I into the registers V0
+    // to VX
+    case 0x0065:
+      X = (opcode & 0x0F00) >> 8;
+      for (int i = 0; i <= X; i++) {
+        c8->vRegs[i] = c8->memory[c8->I + i];
+      }
+      break;
+    }
   }
 }
 

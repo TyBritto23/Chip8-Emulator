@@ -4,10 +4,11 @@
 #include <time.h>
 
 int main(int argc, char **argv) {
-  srand(time(NULL));
-  int opcode = 0xC955;
-  uint8_t x = (opcode & 0x0F00) >> 8;
-  uint8_t NN = opcode & 0x00FF;
-
-  printf("Ranodm Number: %d\n", (rand() & 0xFF) & NN);
+  int hex = 0xBEEA;
+  uint16_t opcode = (c8.memory[c8.pc] << 8) | (c8.memory[c8.pc + 1]);
+  // Temp method to exit loop early
+  printf("0x%x", opcode);
+  if (opcode == 0x0000) {
+    printf("\nEnd of ROM or empty memory reached\n");
+  }
 }
